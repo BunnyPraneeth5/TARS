@@ -3,6 +3,7 @@ arena_mcp/poll.py – Polling loop: get_task → solve → submit_task, repeat.
 
 Runs until interrupted (Ctrl-C) or a FINISH signal file is detected.
 Supports Gemini (via ADK) and NVIDIA (via OpenAI-compatible API) as LLM providers.
+Uses a provider pool with 429 cooldown to gracefully handle rate limits.
 """
 
 from __future__ import annotations
@@ -10,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import config
-from arena_mcp.client import TaskPayload, get_task, submit_task
+from arena_mcp.client import TaskPayload, get_task, register_agent, skip_task, submit_task
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 BASE_POLL_INTERVAL: float = 5.0     # seconds between polls when a task was found
 IDLE_POLL_INTERVAL: float = 30.0    # seconds between polls when queue is empty
 MAX_BACKOFF: float = 120.0          # ceiling for exponential backoff on errors
+PASS_SCORE_THRESHOLD: int = 70      # minimum score to consider a task passed
 
 FINISH_SIGNAL_FILE: Path = Path("FINISH")  # touch this file to stop the loop
 
@@ -31,10 +35,113 @@ CONTENT_DIR: Path = Path("content/tasks")
 # Regex to strip invalid filename chars on Windows (: * ? " < > |)
 _INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*]')
 
-SOLVE_SYSTEM_PROMPT = (
-    "You are a Python expert. Solve the given coding problem. "
-    "Return only the Python code, no explanation, no markdown fences."
-)
+
+# ── Provider pool ──────────────────────────────────────────────────────────
+
+@dataclass
+class Provider:
+    """Represents an LLM provider with rate-limit cooldown tracking."""
+
+    name: str
+    available: bool = True
+    last_429: float = 0.0
+    cooldown: float = 300.0  # seconds to wait after a 429
+
+    def mark_429(self) -> None:
+        """Mark this provider as rate-limited right now."""
+        self.last_429 = time.monotonic()
+        self.available = False
+        logger.warning("Provider %s hit 429 – cooling down for %.0fs", self.name, self.cooldown)
+
+    def check_ready(self) -> bool:
+        """Return True if the cooldown has elapsed (and flip available back)."""
+        if self.available:
+            return True
+        if time.monotonic() - self.last_429 >= self.cooldown:
+            self.available = True
+            logger.info("Provider %s cooldown expired – available again", self.name)
+            return True
+        return False
+
+    @property
+    def seconds_until_ready(self) -> float:
+        """Seconds remaining until this provider's cooldown expires."""
+        if self.available:
+            return 0.0
+        remaining = self.cooldown - (time.monotonic() - self.last_429)
+        return max(remaining, 0.0)
+
+
+# Global pool – order determines priority
+_provider_pool: list[Provider] = [
+    Provider(name="gemini"),
+    Provider(name="nvidia"),
+]
+
+
+def _get_ready_provider() -> Provider | None:
+    """Return the first provider that is not in cooldown, or None."""
+    for p in _provider_pool:
+        if p.check_ready():
+            return p
+    return None
+
+
+async def _wait_for_any_provider() -> Provider:
+    """Sleep until the soonest provider recovers, then return it."""
+    soonest = min(_provider_pool, key=lambda p: p.seconds_until_ready)
+    wait = soonest.seconds_until_ready
+    if wait > 0:
+        logger.info(
+            "All providers in cooldown – sleeping %.0fs until %s is ready",
+            wait, soonest.name,
+        )
+        await asyncio.sleep(wait)
+    soonest.available = True
+    return soonest
+
+
+def _is_429_error(exc: Exception) -> bool:
+    """Detect HTTP 429 (rate limit) errors from various client libraries."""
+    msg = str(exc).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return True
+    # Check for status_code attribute (httpx / openai exceptions)
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    return status == 429
+
+
+# ── Prompt builder ──────────────────────────────────────────────────────────
+
+def _build_prompt(task: TaskPayload) -> str:
+    """Build a task-aware system+user prompt for the LLM.
+
+    Instead of assuming every task is Python code, the prompt describes
+    the task's title and full description, and instructs the LLM that its
+    response will be scored 0-100, needing ≥70 to advance.
+    """
+    return (
+        f"# Task: {task.slug}\n\n"
+        f"## Description\n{task.prompt}\n\n"
+        "## Instructions\n"
+        "Solve the task described above. Your submission will be automatically "
+        "scored on a scale of 0-100. You need a score of 70 or higher to pass "
+        "and level up to the next task.\n\n"
+        "Provide ONLY the solution content — no explanations, no commentary, "
+        "no markdown fences unless the task specifically requires markdown. "
+        "Match the expected output format exactly."
+    )
+
+
+def _build_system_prompt() -> str:
+    """Build the system prompt for the LLM provider."""
+    return (
+        "You are an expert problem solver competing in Agent Arena. "
+        "You receive tasks that may involve code (in any language), analysis, "
+        "writing, math, or other domains. Read the task description carefully "
+        "and produce the highest-quality solution you can. Your response is "
+        "scored 0-100 and you need ≥70 to advance. Return only the solution."
+    )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -128,6 +235,7 @@ async def _solve_with_gemini(prompt: str) -> str:
 
 async def _call_nvidia_with_retry(
     prompt: str,
+    system_prompt: str,
     max_attempts: int = 3,
 ) -> str:
     """Call NVIDIA's OpenAI-compatible API with exponential backoff."""
@@ -144,7 +252,7 @@ async def _call_nvidia_with_retry(
             response = await client.chat.completions.create(
                 model=config.NVIDIA_MODEL,
                 messages=[
-                    {"role": "system", "content": SOLVE_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
@@ -171,9 +279,9 @@ async def _call_nvidia_with_retry(
     raise RuntimeError(f"NVIDIA failed after {max_attempts} attempts") from last_exc
 
 
-async def _solve_with_nvidia(prompt: str) -> str:
+async def _solve_with_nvidia(prompt: str, system_prompt: str) -> str:
     """Solve a task using the NVIDIA Nemotron model."""
-    return await _call_nvidia_with_retry(prompt)
+    return await _call_nvidia_with_retry(prompt, system_prompt)
 
 
 # ── solve_task ──────────────────────────────────────────────────────────────
@@ -181,14 +289,17 @@ async def _solve_with_nvidia(prompt: str) -> str:
 async def solve_task(task: TaskPayload) -> Path:
     """Solve a single Arena task and write the result to a submission file.
 
-    Uses either Gemini (via ADK) or NVIDIA (via OpenAI-compatible API)
-    depending on the LLM_PROVIDER config setting.
+    Picks the first available provider from the pool. If a provider returns
+    a 429, it is put into cooldown and the next provider is tried.
 
     Args:
         task: The task payload from the Arena MCP server.
 
     Returns:
         Path to the generated submission file.
+
+    Raises:
+        RuntimeError: If all providers fail (non-429 errors).
     """
     # Log the full payload for debugging
     logger.info(
@@ -197,24 +308,54 @@ async def solve_task(task: TaskPayload) -> Path:
     )
     logger.debug("Full task prompt:\n%s", task.prompt)
 
-    # Build the prompt
-    user_prompt = (
-        f"Task: {task.slug}\n\n"
-        f"{task.prompt}\n\n"
-        f"{SOLVE_SYSTEM_PROMPT}"
-    )
+    # Build the task-aware prompt
+    user_prompt = _build_prompt(task)
+    system_prompt = _build_system_prompt()
 
-    provider = config.LLM_PROVIDER
-    logger.info(
-        "Sending task %s (%s) to %s...",
-        task.task_id, task.slug, provider.upper(),
-    )
+    # Try providers from the pool
+    last_exc: Exception | None = None
+    tried: set[str] = set()
+    raw_solution: str | None = None
 
-    # Dispatch to the configured provider
-    if provider == "nvidia":
-        raw_solution = await _solve_with_nvidia(user_prompt)
+    while True:
+        provider = _get_ready_provider()
+        if provider is None:
+            provider = await _wait_for_any_provider()
+
+        if provider.name in tried:
+            # We've already tried this provider and it failed with a non-429 error
+            break
+
+        logger.info(
+            "Sending task %s (%s) to %s...",
+            task.task_id, task.slug, provider.name.upper(),
+        )
+
+        try:
+            if provider.name == "nvidia":
+                raw_solution = await _solve_with_nvidia(user_prompt, system_prompt)
+            else:
+                raw_solution = await _solve_with_gemini(user_prompt)
+            break  # success
+        except Exception as exc:
+            last_exc = exc
+            tried.add(provider.name)
+            if _is_429_error(exc):
+                provider.mark_429()
+                continue  # try next provider
+            logger.error("Provider %s failed with non-429 error: %s", provider.name, exc)
+            # Try remaining providers before giving up
+            other_ready = [p for p in _provider_pool if p.name not in tried and p.check_ready()]
+            if other_ready:
+                continue
+            break
     else:
-        raw_solution = await _solve_with_gemini(user_prompt)
+        # while/else: loop exited without break (shouldn't happen, but guard)
+        if raw_solution is None:
+            raise RuntimeError("All providers exhausted") from last_exc
+
+    if raw_solution is None:
+        raise RuntimeError("All providers failed") from last_exc
 
     # Strip any markdown code fences the LLM may have included
     solution = _strip_code_fences(raw_solution)
@@ -242,6 +383,8 @@ async def solve_task(task: TaskPayload) -> Path:
 async def run_loop() -> None:
     """Poll for tasks, solve them, submit results. Repeat until stopped.
 
+    Registers the agent once at startup, then enters the poll loop.
+
     Stop conditions:
         - KeyboardInterrupt (Ctrl-C)
         - A file named ``FINISH`` exists in the working directory
@@ -252,6 +395,13 @@ async def run_loop() -> None:
         "Agent Arena poll loop starting (agent_id=%s, provider=%s)",
         config.AGENT_ID, config.LLM_PROVIDER.upper(),
     )
+
+    # ── Register agent once at startup ──────────────────────────────────
+    try:
+        reg_response = await register_agent(config.AGENT_ID)
+        logger.info("Agent registered successfully: %s", reg_response)
+    except Exception:
+        logger.exception("Failed to register agent – continuing anyway")
 
     try:
         while True:
@@ -277,7 +427,26 @@ async def run_loop() -> None:
 
                 # ── 3. Submit ───────────────────────────────────────────
                 response = await submit_task(config.AGENT_ID, task.task_id, submission_path)
-                logger.info("Submitted task %s – server response: %s", task.task_id, response)
+
+                # ── 4. Parse score & skip if below threshold ────────────
+                score = response.get("score", 0) if isinstance(response, dict) else 0
+                logger.info(
+                    "Task %s score: %s (threshold=%d) – response: %s",
+                    task.task_id, score, PASS_SCORE_THRESHOLD, response,
+                )
+
+                if score < PASS_SCORE_THRESHOLD:
+                    logger.warning(
+                        "Score %s < %d for task %s – skipping to unlock next task",
+                        score, PASS_SCORE_THRESHOLD, task.task_id,
+                    )
+                    try:
+                        skip_response = await skip_task(config.AGENT_ID, task.task_id)
+                        logger.info("Skip response for task %s: %s", task.task_id, skip_response)
+                    except Exception:
+                        logger.exception("Failed to skip task %s", task.task_id)
+                else:
+                    logger.info("Task %s PASSED with score %s ✓", task.task_id, score)
 
                 consecutive_errors = 0
                 await asyncio.sleep(BASE_POLL_INTERVAL)
@@ -290,9 +459,19 @@ async def run_loop() -> None:
                 )
                 raise
 
-            except Exception:
+            except Exception as exc:
                 consecutive_errors += 1
                 backoff = min(BASE_POLL_INTERVAL * (2 ** consecutive_errors), MAX_BACKOFF)
+
+                # If this is a 429 from the solve step, mark the provider
+                if _is_429_error(exc):
+                    # Mark whichever provider was being used
+                    provider_name = config.LLM_PROVIDER
+                    for p in _provider_pool:
+                        if p.name == provider_name:
+                            p.mark_429()
+                            break
+
                 logger.exception("Error in poll loop (attempt %d) – backing off %.0fs", consecutive_errors, backoff)
                 await asyncio.sleep(backoff)
 

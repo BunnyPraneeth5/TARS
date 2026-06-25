@@ -1,7 +1,8 @@
 """
 arena_mcp/client.py – Thin wrapper around fastmcp.Client for Agent Arena.
 
-Provides get_task() and submit_task() with automatic JWT retry on AUTH_ERROR.
+Provides get_task(), submit_task(), skip_task(), and register_agent()
+with automatic JWT retry on AUTH_ERROR.
 """
 
 from __future__ import annotations
@@ -176,6 +177,81 @@ async def submit_task(agent_id: str, task_id: str, file_path: str | Path) -> dic
     except Exception as exc:
         if _is_auth_error(exc):
             logger.warning("AUTH_ERROR on submit_task – refreshing JWT and retrying once.")
+            config.refresh_jwt()
+            return await _call()
+        raise
+
+
+async def skip_task(agent_id: str, task_id: str) -> dict[str, Any]:
+    """Skip (unlock) a task so the server can issue the next one.
+
+    Typically called when a submission scores below the passing threshold
+    and the agent wants to move on rather than retry the same task.
+
+    Args:
+        agent_id: The agent identifier registered with Agent Arena.
+        task_id:  The task ID to skip.
+
+    Returns:
+        The raw response dict from the Arena server.
+
+    Raises:
+        AuthError: If the server rejects us after one JWT-refresh retry.
+    """
+    async def _call() -> dict[str, Any]:
+        async with _build_client() as client:
+            result = await client.call_tool(
+                "skip_task",
+                {
+                    "idToken": config.EPHEMERAL_JWT,
+                    "agentId": agent_id,
+                    "taskId": task_id,
+                },
+            )
+            parsed = _parse_tool_result(result)
+            return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+    try:
+        return await _call()
+    except Exception as exc:
+        if _is_auth_error(exc):
+            logger.warning("AUTH_ERROR on skip_task – refreshing JWT and retrying once.")
+            config.refresh_jwt()
+            return await _call()
+        raise
+
+
+async def register_agent(agent_id: str) -> dict[str, Any]:
+    """Register the agent with the Arena MCP server.
+
+    Should be called once at startup before the poll loop begins.
+
+    Args:
+        agent_id: The agent identifier to register.
+
+    Returns:
+        The raw response dict from the Arena server.
+
+    Raises:
+        AuthError: If the server rejects us after one JWT-refresh retry.
+    """
+    async def _call() -> dict[str, Any]:
+        async with _build_client() as client:
+            result = await client.call_tool(
+                "register_agent",
+                {
+                    "idToken": config.EPHEMERAL_JWT,
+                    "agentId": agent_id,
+                },
+            )
+            parsed = _parse_tool_result(result)
+            return parsed if isinstance(parsed, dict) else {"raw": parsed}
+
+    try:
+        return await _call()
+    except Exception as exc:
+        if _is_auth_error(exc):
+            logger.warning("AUTH_ERROR on register_agent – refreshing JWT and retrying once.")
             config.refresh_jwt()
             return await _call()
         raise
