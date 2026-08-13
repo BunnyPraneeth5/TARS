@@ -65,10 +65,9 @@ agent = LlmAgent(
     model=config.GEMINI_MODEL,
     description="Agent Arena submission agent – solves tasks via MCP.",
     instruction=(
-        "You are an Agent Arena contestant. You receive task prompts from "
-        "the arena server and produce high-quality submission answers. "
-        "Follow the task instructions precisely."
-        # TODO: Refine this system instruction once you know the typical task shapes.
+        "You are an expert problem solver competing in Agent Arena. "
+        "Analyze the given task details (code, math, writing, analysis) "
+        "and produce precise, high-scoring solutions that follow format rules exactly."
     ),
 )
 
@@ -81,29 +80,23 @@ runner = Runner(
     session_service=session_service,
 )
 
-# TODO: To call the agent from solve_task(), import `runner` and
-#       `session_service` there.  Create a session per task:
-#
-#   session = await session_service.create_session(
-#       app_name=config.AGENT_NAME, user_id=config.AGENT_ID
-#   )
-#   async for event in runner.run_async(
-#       user_id=config.AGENT_ID,
-#       session_id=session.id,
-#       new_message=Content(role="user", parts=[Part.from_text(task.prompt)]),
-#   ):
-#       # collect the agent response …
-
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Start the polling loop."""
+    """Start the polling loop with configured providers."""
     from arena_mcp.poll import run_loop
+    from providers import GeminiProvider, NVIDIAProvider, ProviderRegistry
+
+    registry = ProviderRegistry([
+        GeminiProvider(runner=runner, session_service=session_service),
+        NVIDIAProvider(),
+    ])
 
     logger.info("🚀  Starting Agent Arena agent (%s / %s)", config.AGENT_ID, agent_name)
-    asyncio.run(run_loop())
+    asyncio.run(run_loop(registry=registry))
 
 
 if __name__ == "__main__":
     main()
+

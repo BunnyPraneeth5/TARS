@@ -48,18 +48,22 @@ NVIDIA_BASE_URL: str = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.
 
 # ── JWT refresh stub ────────────────────────────────────────────────────────
 def refresh_jwt() -> str:
-    """Re-authenticate with the Arena auth endpoint and return a fresh JWT.
+    """Re-load EPHEMERAL_JWT from .env / environment or notify developer.
 
-    TODO: Implement once the Arena auth docs are available.
-      1. POST to the auth endpoint (unknown URL) with agent credentials.
-      2. Parse the response for a new ephemeral JWT.
-      3. Update the module-level EPHEMERAL_JWT so subsequent MCP calls use it.
-      4. Persist the new JWT to .env or an in-memory store as needed.
-
-    Raises:
-        NotImplementedError: Always, until the real auth flow is wired up.
+    Attempts to reload environment variables from .env to pick up any manually
+    updated EPHEMERAL_JWT without requiring a full application restart.
     """
-    raise NotImplementedError(
-        "TODO: refresh_jwt() – fill in once you know the Arena auth endpoint "
-        "and credential exchange flow."
+    global EPHEMERAL_JWT
+    load_dotenv(override=True)
+    new_jwt = os.environ.get("EPHEMERAL_JWT", "")
+    if new_jwt and new_jwt != EPHEMERAL_JWT:
+        sys.stderr.write("[config] EPHEMERAL_JWT refreshed from .env file.\n")
+        EPHEMERAL_JWT = new_jwt
+        return EPHEMERAL_JWT
+
+    sys.stderr.write(
+        "[config] WARNING: EPHEMERAL_JWT authentication failed and no new JWT found in .env.\n"
+        "[config] Please update EPHEMERAL_JWT in your .env file to continue.\n"
     )
+    return EPHEMERAL_JWT
+

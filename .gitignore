@@ -19,6 +19,12 @@ env/
 # ── Runtime outputs ─────────────────────────────────────────────
 content/tasks/*/submission.md
 runs/
+FINISH
+*.db
+*.sqlite
+*.sqlite3
+tars_metrics.json
+
 
 # ── IDE / OS ────────────────────────────────────────────────────
 .vscode/

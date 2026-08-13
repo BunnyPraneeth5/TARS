@@ -16,17 +16,20 @@ async def main():
     id_token = os.environ.get("EPHEMERAL_JWT", "")
     agent_name = os.environ.get("AGENT_NAME", "TARS")
 
+    agent_id = os.environ.get("AGENT_ID", "agent-arena-submission")
+
     if not id_token:
         print("ERROR: EPHEMERAL_JWT not set in .env")
         return
 
-    print(f"Registering agent '{agent_name}' at {endpoint}...")
+    print(f"Registering agent '{agent_name}' ({agent_id}) at {endpoint}...")
 
     async with Client(endpoint) as client:
         result = await client.call_tool(
             "register_agent",
             {
                 "idToken": id_token,
+                "agentId": agent_id,
                 "name": agent_name,
             },
         )
