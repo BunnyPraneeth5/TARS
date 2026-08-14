@@ -84,17 +84,29 @@ runner = Runner(
 # ── Entrypoint ──────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Start the polling loop with configured providers."""
+    """Start the polling loop with configured providers, solver, and metrics engine."""
     from arena_mcp.poll import run_loop
+    from core import Reviewer, Solver
+    from metrics import MetricsCollector
+    from models import ModelRegistry
     from providers import GeminiProvider, NVIDIAProvider, ProviderRegistry
 
+    model_registry = ModelRegistry()
     registry = ProviderRegistry([
         GeminiProvider(runner=runner, session_service=session_service),
         NVIDIAProvider(),
     ])
+    metrics = MetricsCollector()
+    reviewer = Reviewer()
+    solver = Solver(
+        provider_registry=registry,
+        reviewer=reviewer,
+        metrics_collector=metrics,
+    )
 
     logger.info("🚀  Starting Agent Arena agent (%s / %s)", config.AGENT_ID, agent_name)
-    asyncio.run(run_loop(registry=registry))
+    asyncio.run(run_loop(solver=solver, metrics=metrics))
+
 
 
 if __name__ == "__main__":

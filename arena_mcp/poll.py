@@ -1,8 +1,7 @@
 """arena_mcp/poll.py – Polling loop: get_task → solve → submit_task, repeat.
 
 Runs until interrupted (Ctrl-C) or a FINISH signal file is detected.
-Uses ProviderRegistry for provider selection and cooldown management.
-Uses TaskClassifier and PromptBuilder for task-type-aware prompts.
+Uses Solver orchestrator, ProviderRegistry, Reviewer, and MetricsCollector.
 """
 
 from __future__ import annotations
@@ -15,7 +14,8 @@ from typing import Any
 
 import config
 from arena_mcp.client import TaskPayload, get_task, register_agent, skip_task, submit_task
-from prompts import PromptBuilder, TaskClassifier
+from core import Solver
+from metrics import MetricsCollector, export_json
 from providers import AbstractProvider, ProviderRegistry
 
 logger = logging.getLogger(__name__)
@@ -37,123 +37,55 @@ _INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _strip_code_fences(text: str) -> str:
-    """Remove markdown code fences from LLM output if present."""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.split("\n")
-        lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines)
-    return stripped
-
-
 def _safe_slug(slug: str) -> str:
     """Convert a task slug into a filesystem-safe directory name."""
     safe = _INVALID_PATH_CHARS.sub("_", slug)
     return safe.strip("_ ")
 
 
-def _create_default_registry() -> ProviderRegistry:
-    """Fallback registry setup if none is passed to run_loop or solve_task."""
+def _create_default_solver(metrics: MetricsCollector | None = None) -> Solver:
+    """Fallback solver setup if none is passed to run_loop or solve_task."""
     from agent import runner, session_service
     from providers import GeminiProvider, NVIDIAProvider
 
-    return ProviderRegistry([
+    registry = ProviderRegistry([
         GeminiProvider(runner=runner, session_service=session_service),
         NVIDIAProvider(),
     ])
+    return Solver(provider_registry=registry, metrics_collector=metrics)
 
 
 # ── solve_task ──────────────────────────────────────────────────────────────
 
-async def solve_task(task: TaskPayload, registry: ProviderRegistry | None = None) -> Path:
-    """Solve a single Arena task and write the result to a submission file.
-
-    Picks the first available provider from the registry. If a provider returns
-    a 429, it is put into cooldown and the next provider is tried.
+async def solve_task(
+    task: TaskPayload,
+    registry: ProviderRegistry | None = None,
+    solver: Solver | None = None,
+) -> Path:
+    """Solve a single Arena task using Solver orchestrator and write to submission.md.
 
     Args:
         task: The task payload from the Arena MCP server.
-        registry: ProviderRegistry instance managing available LLM providers.
+        registry: Optional ProviderRegistry instance.
+        solver: Optional Solver instance.
 
     Returns:
         Path to the generated submission file.
-
-    Raises:
-        RuntimeError: If all providers fail.
     """
-    if registry is None:
-        registry = _create_default_registry()
+    if solver is None:
+        if registry is not None:
+            solver = Solver(provider_registry=registry)
+        else:
+            solver = _create_default_solver()
 
-    # Log task details
-    logger.info(
-        "Task payload: task_id=%s slug=%s prompt_len=%d metadata=%r",
-        task.task_id, task.slug, len(task.prompt), task.metadata,
-    )
-    logger.debug("Full task prompt:\n%s", task.prompt)
-
-    # Classify task & build prompts
-    classifier = TaskClassifier()
-    builder = PromptBuilder()
-
-    task_type = classifier.classify(task)
-    user_prompt = builder.build_prompt(task, task_type)
-    system_prompt = builder.build_system_prompt(task_type)
-
-    last_exc: Exception | None = None
-    tried: set[str] = set()
-    raw_solution: str | None = None
-
-    while True:
-        provider = registry.get_ready_provider()
-        if provider is None:
-            provider = await registry.wait_for_any_provider()
-
-        if provider.name in tried:
-            break
-
-        logger.info(
-            "Sending task %s (%s) to %s (type=%s)...",
-            task.task_id, task.slug, provider.name.upper(), task_type.name,
-        )
-
-        try:
-            raw_solution = await provider.solve(user_prompt, system_prompt)
-            break  # success
-        except Exception as exc:
-            last_exc = exc
-            tried.add(provider.name)
-            if AbstractProvider.is_429_error(exc):
-                provider.mark_rate_limited()
-                continue  # try next provider
-
-            logger.error("Provider %s failed with non-429 error: %s", provider.name, exc)
-            other_ready = [p for p in registry.get_all() if p.name not in tried and p.check_ready()]
-            if other_ready:
-                continue
-            break
-
-    if raw_solution is None:
-        raise RuntimeError("All providers failed") from last_exc
-
-    # Strip code fences
-    solution = _strip_code_fences(raw_solution)
-
-    # Log preview
-    preview = solution[:200].replace("\n", "\\n")
-    logger.info(
-        "Solution for %s (%d chars): %s%s",
-        task.slug, len(solution), preview, "..." if len(solution) > 200 else "",
-    )
+    solution = await solver.solve(task)
 
     # Write submission file
     slug_safe = _safe_slug(task.slug)
     task_dir = CONTENT_DIR / slug_safe
     task_dir.mkdir(parents=True, exist_ok=True)
     submission_path = task_dir / "submission.md"
-    submission_path.write_text(solution, encoding="utf-8")
+    submission_path.write_text(solution.content, encoding="utf-8")
     logger.info("Wrote submission to %s", submission_path)
 
     return submission_path
@@ -161,19 +93,31 @@ async def solve_task(task: TaskPayload, registry: ProviderRegistry | None = None
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 
-async def run_loop(registry: ProviderRegistry | None = None) -> None:
+async def run_loop(
+    registry: ProviderRegistry | None = None,
+    solver: Solver | None = None,
+    metrics: MetricsCollector | None = None,
+) -> None:
     """Poll for tasks, solve them, submit results. Repeat until stopped.
 
     Args:
-        registry: Optional ProviderRegistry instance. If None, default registry is constructed.
+        registry: Optional ProviderRegistry instance.
+        solver: Optional Solver instance.
+        metrics: Optional MetricsCollector instance.
     """
-    if registry is None:
-        registry = _create_default_registry()
+    if metrics is None:
+        metrics = MetricsCollector()
+
+    if solver is None:
+        if registry is not None:
+            solver = Solver(provider_registry=registry, metrics_collector=metrics)
+        else:
+            solver = _create_default_solver(metrics=metrics)
 
     consecutive_errors = 0
     logger.info(
-        "Agent Arena poll loop starting (agent_id=%s, registered_providers=%s)",
-        config.AGENT_ID, [p.name for p in registry.get_all()],
+        "Agent Arena poll loop starting (agent_id=%s, solver_providers=%s)",
+        config.AGENT_ID, [p.name for p in solver.registry.get_all()],
     )
 
     # ── Register agent once at startup ──────────────────────────────────
@@ -201,13 +145,13 @@ async def run_loop(registry: ProviderRegistry | None = None) -> None:
 
                 logger.info("Got task %s (slug=%s)", task.task_id, task.slug)
 
-                # 2. Solve task using provider registry
-                submission_path = await solve_task(task, registry=registry)
+                # 2. Solve task using Solver
+                submission_path = await solve_task(task, solver=solver)
 
                 # 3. Submit solution
                 response = await submit_task(config.AGENT_ID, task.task_id, submission_path)
 
-                # 4. Score evaluation
+                # 4. Score evaluation & metrics export
                 score = response.get("score", 0) if isinstance(response, dict) else 0
                 logger.info(
                     "Task %s score: %s (threshold=%d) – response: %s",
@@ -227,6 +171,9 @@ async def run_loop(registry: ProviderRegistry | None = None) -> None:
                 else:
                     logger.info("Task %s PASSED with score %s ✓", task.task_id, score)
 
+                # Export metrics snapshot
+                export_json(metrics)
+
                 consecutive_errors = 0
                 await asyncio.sleep(BASE_POLL_INTERVAL)
 
@@ -240,4 +187,5 @@ async def run_loop(registry: ProviderRegistry | None = None) -> None:
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt – shutting down poll loop.")
     finally:
+        export_json(metrics)
         logger.info("Poll loop stopped.")

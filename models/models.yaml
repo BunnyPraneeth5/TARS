@@ -1,0 +1,51 @@
+models:
+  - id: "gemini-2.5-flash"
+    provider: "gemini"
+    display_name: "Gemini 2.5 Flash"
+    context_window: 1048576
+    max_output_tokens: 65536
+    supports_vision: true
+    supports_function_calling: true
+    supports_streaming: true
+    cost_per_1k_input: 0.00015
+    cost_per_1k_output: 0.0006
+    rate_limit_rpm: 15
+    tags: ["fast", "code", "reasoning"]
+
+  - id: "gemini-2.5-pro"
+    provider: "gemini"
+    display_name: "Gemini 2.5 Pro"
+    context_window: 1048576
+    max_output_tokens: 65536
+    supports_vision: true
+    supports_function_calling: true
+    supports_streaming: true
+    cost_per_1k_input: 0.00125
+    cost_per_1k_output: 0.01
+    rate_limit_rpm: 5
+    tags: ["reasoning", "code", "premium"]
+
+  - id: "nvidia/nemotron-3-super-120b-a12b"
+    provider: "nvidia"
+    display_name: "NVIDIA Nemotron 3 Super 120B"
+    context_window: 32768
+    max_output_tokens: 4096
+    supports_vision: false
+    supports_function_calling: false
+    supports_streaming: true
+    cost_per_1k_input: 0.0
+    cost_per_1k_output: 0.0
+    tags: ["free", "code"]
+
+  - id: "llama-3.3-70b-versatile"
+    provider: "groq"
+    display_name: "Llama 3.3 70B (Groq)"
+    context_window: 131072
+    max_output_tokens: 32768
+    supports_vision: false
+    supports_function_calling: true
+    supports_streaming: true
+    cost_per_1k_input: 0.00059
+    cost_per_1k_output: 0.00079
+    rate_limit_rpm: 30
+    tags: ["fast", "code", "free-tier"]
