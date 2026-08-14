@@ -1,90 +1,89 @@
-# Agent Arena Submission Agent
+# TARS — Autonomous AI Problem-Solving Agent
 
-A production-shaped Python agent scaffold for [Agent Arena](https://agent-arena.dev) submissions. Built on **Google ADK + Gemini + FastMCP**.
+TARS is an **autonomous, self-healing AI problem-solving agent** designed to compete on **[Agent Arena](https://agent-arena.dev)** and benchmark platforms via **Model Context Protocol (MCP)**.
 
-> **This is boilerplate only.** Task-solving logic, real MCP tool names, and the auth-refresh flow are left as clearly-marked TODO stubs.
+It features multi-provider rate-limit failover (**Google Gemini** + **NVIDIA Nemotron**), domain-aware task classification, pre-submission quality assurance, and real-time telemetry tracking.
 
 ---
 
-## Quick Start
+## 📚 Documentation & Guides
+
+- **[User & Beginner Guide](file:///c:/Users/karup/projects/Agent-Dev/AgentArena/docs/USER_GUIDE.md)** — **Start here!** Plain-English explanation of why TARS exists, how it works step-by-step, and who benefits.
+- **[Codebase Guide](file:///c:/Users/karup/projects/Agent-Dev/AgentArena/docs/CODEBASE_GUIDE.md)** — In-depth developer guide to every module, data flow, and file relationship.
+- **[Provider Extension Guide](file:///c:/Users/karup/projects/Agent-Dev/AgentArena/docs/PROVIDER_GUIDE.md)** — How to add new LLM providers (Groq, Anthropic, Ollama).
+- **[Architecture & Future Roadmap](file:///c:/Users/karup/projects/Agent-Dev/AgentArena/docs/FUTURE_UPDATES.md)** — Long-term engineering roadmap and milestone progress.
+
+---
+
+## ⚡ Quick Start
 
 ```bash
 cd AgentArena
 
-# 1. Create and activate a virtual environment
-python -m venv .venv
+# 1. Activate virtual environment
 # Windows:
-.venv\Scripts\activate
-# macOS/Linux:
+.\.venv\Scripts\activate
+# Linux/macOS:
 # source .venv/bin/activate
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 2. Configure environment variables in .env
+# (Ensure GEMINI_API_KEY, NVIDIA_API_KEY, MCP_ENDPOINT, and EPHEMERAL_JWT are set)
 
-# 3. Configure environment
-cp .env.example .env
-# Edit .env with your real GEMINI_API_KEY and MCP_ENDPOINT
-
-# 4. Run
+# 3. Run the Agent
 python agent.py
 ```
 
 ---
 
-## Project Structure
+## 🏗️ Architecture Overview
 
 ```
 AgentArena/
-├── agent.py                   # Entrypoint: ADK agent setup + poll loop launch
-├── config.py                  # Env loading, validation, JWT refresh stub
-├── arena_mcp/
-│   ├── __init__.py
-│   ├── client.py              # MCP client: get_task(), submit_task() with JWT retry
-│   └── poll.py                # Poll loop: get → solve → submit, backoff & clean stop
-├── content/
-│   └── tasks/                 # Output dir: one subfolder per task slug
-├── scripts/
-│   └── check_secrets.py       # Pre-push secret scanner
-├── deploy/
-│   ├── Dockerfile             # Python 3.12-slim container
-│   └── cloudbuild.yaml        # GCP Cloud Run Job stub (placeholders)
-├── .env.example               # All config vars with placeholder values
-├── .gitignore
-├── requirements.txt
-└── README.md                  # ← you are here
+├── agent.py                   # Main entrypoint: Initializes providers, solver, & poll loop
+├── config.py                  # Env validation & hot-reload JWT refresh
+├── providers/                 # LLM Provider Abstraction Layer
+│   ├── base.py                # AbstractProvider ABC & 429 rate-limit cooldown
+│   ├── registry.py            # ProviderRegistry priority pool & failover engine
+│   ├── retry.py               # Shared exponential backoff utility
+│   ├── gemini.py              # Google Gemini ADK provider implementation
+│   └── nvidia.py              # NVIDIA Nemotron OpenAI-compatible implementation
+├── prompts/                   # Task Classifier & Prompt Builder Layer
+│   ├── classifier.py          # Domain classifier (CODE, WRITING, MATH, ANALYSIS)
+│   ├── builder.py             # PromptBuilder rendering domain-specific guidelines
+│   └── templates/             # Per-domain prompt templates (code.py, writing.py, default.py)
+├── models/                    # Model Registry & Capabilities Catalog
+│   ├── config.py              # ModelConfig dataclass (context windows, pricing)
+│   ├── registry.py            # ModelRegistry query engine
+│   └── models.yaml            # Declarative YAML catalog
+├── core/                      # Core Pipeline Engine
+│   ├── solver.py              # Solver orchestrator
+│   ├── reviewer.py            # Reviewer agent filtering AI refusals & format flaws
+│   └── types.py               # SolveStrategy & Solution data contracts
+├── metrics/                   # Telemetry & Performance Engine
+│   ├── collector.py           # MetricsCollector in-memory engine
+│   └── exporters.py           # JSON snapshot exporter (tars_metrics.json)
+├── arena_mcp/                 # Agent Arena MCP Adapter
+│   ├── client.py              # MCP client wrappers (get_task, submit_task, skip_task)
+│   └── poll.py                # Main polling loop execution
+├── content/tasks/             # Saved submissions (content/tasks/<slug>/submission.md)
+└── scripts/
+    └── check_secrets.py       # Pre-push secret scanner
 ```
 
 ---
 
-## Key TODOs
+## 🛠️ Common Commands
 
-| File | Function | What to fill in |
-|------|----------|----------------|
-| `config.py` | `refresh_jwt()` | Auth endpoint URL + credential exchange flow |
-| `arena_mcp/client.py` | `get_task()` | Real MCP tool name, response schema mapping |
-| `arena_mcp/client.py` | `submit_task()` | Real MCP tool name, payload format |
-| `arena_mcp/poll.py` | `solve_task()` | Your actual task-solving pipeline |
-| `deploy/cloudbuild.yaml` | substitutions | GCP project, region, service account |
-
----
-
-## Stopping the Agent
-
-- **Ctrl-C** — graceful shutdown via `KeyboardInterrupt`
-- **Touch `FINISH`** — create a file named `FINISH` in the working directory
+| Task | Command |
+|---|---|
+| **Start Agent Polling Loop** | `python agent.py` |
+| **Register Agent Manually** | `python register_agent.py` |
+| **Discover Server MCP Tools** | `python discover_tools.py` |
+| **Scan Repo for Secrets** | `python scripts/check_secrets.py` |
+| **Graceful Shutdown** | Create a file named `FINISH` in the working directory |
 
 ---
 
-## Pre-Push Secret Check
+## 🛡️ License
 
-```bash
-python scripts/check_secrets.py
-```
-
-Exits non-zero if potential API keys, JWTs, or secrets are found in tracked files.
-
----
-
-## License
-
-Private — not for redistribution.
+Private — for internal research and competition development.
