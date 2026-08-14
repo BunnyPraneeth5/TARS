@@ -10,9 +10,13 @@ Exits 0 if clean, 1 if potential secrets are detected.
 
 from __future__ import annotations
 
+import io
 import re
 import sys
 from pathlib import Path
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
 
 # ── Patterns ────────────────────────────────────────────────────────────────
 
